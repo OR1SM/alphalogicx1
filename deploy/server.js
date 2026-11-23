@@ -117,40 +117,97 @@ async function gemini(req, res, m, u) {
 }
 
 /* ---------- قراءة النص بصوت Google (Gemini TTS) ----------
-   POST /api/tts {text, lang} → audio/wav. يُخزَّن الصوت مؤقتاً فلا يُطلب النص نفسه مرتين. */
-const TTS_MODELS = ["gemini-3.8-flash-tts", "gemini-3.8-flash-lite-tts", "gemini-3.1-flash-tts-preview", "gemini-2.5-flash-preview-tts"];
-const ttsCache = new Map();
+   GET /api/tts?t=<النص>&l=ar|en → audio/wav (يُخزَّن في المتصفح سنة كاملة).
+   • صوت واحد وأسلوب راوٍ ثابت لكل الطلبات (نبرة موحّدة).
+   • كل مقطع يُولَّد مرة واحدة فقط: ذاكرة السيرفر + تخزين دائم في Supabase Storage (bucket «tts»)
+     إذا وُجد SUPABASE_SECRET_KEY — لأن الخطة المجانية تسمح بـ 10 طلبات صوت يومياً لكل نموذج.
+   • النموذج الذي نفدت حصته يُتخطّى فوراً حتى تتجدد. */
+const crypto2 = require("crypto");
+const TTS_MODELS = ["gemini-3.1-flash-tts-preview", "gemini-3.8-flash-tts", "gemini-3.8-flash-lite-tts", "gemini-2.5-flash-preview-tts"];
+const TTS_VOICE = (process.env.TTS_VOICE || "Charon").trim();
+const TTS_STYLE = {
+  ar: "Read the following Arabic transcript aloud in clear Modern Standard Arabic, as a warm, calm and confident documentary narrator, with one consistent tone and a steady medium pace. Transcript:\n",
+  en: "Read the following transcript aloud in clear English, as a warm, calm and confident documentary narrator, with one consistent tone and a steady medium pace. Transcript:\n"
+};
+const SB_URL = (process.env.SUPABASE_URL || "https://wzxcxxqijquktcakdymx.supabase.co").replace(/\/$/, "");
+const SB_SECRET = (process.env.SUPABASE_SECRET_KEY || "").trim();
+const ttsCache = new Map(), ttsPending = new Map(), exhausted = new Map();
 function wavFromPcm(pcm, rate) {
   const h = Buffer.alloc(44); h.write("RIFF", 0); h.writeUInt32LE(36 + pcm.length, 4); h.write("WAVE", 8); h.write("fmt ", 12); h.writeUInt32LE(16, 16); h.writeUInt16LE(1, 20); h.writeUInt16LE(1, 22);
   h.writeUInt32LE(rate, 24); h.writeUInt32LE(rate * 2, 28); h.writeUInt16LE(2, 32); h.writeUInt16LE(16, 34); h.write("data", 36); h.writeUInt32LE(pcm.length, 40); return Buffer.concat([h, pcm]);
 }
-async function tts(req, res) {
-  const J = {"Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store"};
-  if (!GEMINI) return send(res, 503, JSON.stringify({error: {message: "GEMINI_API_KEY غير مضبوط"}}), J);
-  const ip = String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || "").split(",")[0].trim();
-  if (limited("tts:" + ip)) return send(res, 429, JSON.stringify({error: {message: "طلبات كثيرة"}}), J);
-  let body; try {body = JSON.parse((await readBody(req, 20000)).toString() || "{}");} catch (e) {return send(res, 400, JSON.stringify({error: {message: "bad json"}}), J);}
-  const text = String(body.text || "").replace(/\s+/g, " ").trim().slice(0, 900), voice = /^[A-Za-z]{2,20}$/.test(body.voice || "") ? body.voice : "Kore";
-  if (!text) return send(res, 400, JSON.stringify({error: {message: "no text"}}), J);
-  const key = voice + "|" + text, hit = ttsCache.get(key);
-  const A = {"Content-Type": "audio/wav", "Cache-Control": "public, max-age=86400"};
-  if (hit) {ttsCache.delete(key); ttsCache.set(key, hit); return send(res, 200, hit, A);}
+function ttsKey(text, lang) {return crypto2.createHash("sha1").update("v1|" + TTS_VOICE + "|" + lang + "|" + text).digest("hex");}
+function remember2(key, wav) {ttsCache.set(key, wav); let size = 0; for (const v of ttsCache.values()) size += v.length; while (size > 150e6 && ttsCache.size > 1) {const k = ttsCache.keys().next().value; size -= ttsCache.get(k).length; ttsCache.delete(k);}}
+async function fromStorage(key) {
+  try {const r = await fetch(SB_URL + "/storage/v1/object/public/tts/" + key + ".wav", {signal: AbortSignal.timeout(8000)}); if (r.ok) return Buffer.from(await r.arrayBuffer());} catch (e) { }
+  return null;
+}
+async function toStorage(key, wav) {
+  if (!SB_SECRET) return;
+  try {
+    const r = await fetch(SB_URL + "/storage/v1/object/tts/" + key + ".wav", {method: "POST", body: wav, signal: AbortSignal.timeout(20000),
+      headers: {"Authorization": "Bearer " + SB_SECRET, "apikey": SB_SECRET, "Content-Type": "audio/wav", "x-upsert": "true", "cache-control": "31536000"}});
+    if (!r.ok) console.warn("tts storage", r.status, (await r.text()).slice(0, 160));
+  } catch (e) {console.warn("tts storage", e.message);}
+}
+async function generate(text, lang) {
   let last = "";
   for (const m of TTS_MODELS) {
-    try {
-      const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + m + ":generateContent", {method: "POST", headers: {"Content-Type": "application/json", "x-goog-api-key": GEMINI}, signal: AbortSignal.timeout(30000),
-        body: JSON.stringify({contents: [{parts: [{text}]}], generationConfig: {responseModalities: ["AUDIO"], speechConfig: {voiceConfig: {prebuiltVoiceConfig: {voiceName: voice}}}}})});
-      const j = await r.json().catch(() => ({}));
-      const p = j.candidates && j.candidates[0] && j.candidates[0].content && (j.candidates[0].content.parts || []).find(x => x.inlineData);
-      if (!r.ok || !p) {last = m + ": " + ((j.error && j.error.message) || r.status); continue;}
-      const raw = Buffer.from(p.inlineData.data, "base64"), mt = String(p.inlineData.mimeType || "");
-      const wav = /wav/i.test(mt) || raw.slice(0, 4).toString() === "RIFF" ? raw : wavFromPcm(raw, +((mt.match(/rate=(\d+)/) || [])[1] || 24000));
-      ttsCache.set(key, wav); if (ttsCache.size > 120) ttsCache.delete(ttsCache.keys().next().value);
-      return send(res, 200, wav, A);
-    } catch (e) {last = m + ": " + e.message;}
+    if ((exhausted.get(m) || 0) > Date.now()) {last = m + ": quota"; continue;}
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + m + ":generateContent", {method: "POST", headers: {"Content-Type": "application/json", "x-goog-api-key": GEMINI}, signal: AbortSignal.timeout(45000),
+          body: JSON.stringify({contents: [{parts: [{text: TTS_STYLE[lang] + text}]}], generationConfig: {responseModalities: ["AUDIO"], speechConfig: {voiceConfig: {prebuiltVoiceConfig: {voiceName: TTS_VOICE}}}}})});
+        const j = await r.json().catch(() => ({}));
+        if (r.status === 429) { /* نفدت الحصة اليومية: تخطَّ هذا النموذج حتى موعد التجديد */
+          const d = JSON.stringify(j); const sec = +((d.match(/"retryDelay":"(\d+)s"/) || [])[1] || 0);
+          exhausted.set(m, Date.now() + (/PerDay/i.test(d) ? Math.max(sec, 3600) : Math.max(sec, 20)) * 1000); last = m + ": 429"; break;
+        }
+        const p = j.candidates && j.candidates[0] && j.candidates[0].content && (j.candidates[0].content.parts || []).find(x => x.inlineData);
+        if (!r.ok || !p) {last = m + ": " + ((j.error && j.error.message) || r.status); if (r.status >= 500 && attempt === 0) continue; break;}
+        const raw = Buffer.from(p.inlineData.data, "base64"), mt = String(p.inlineData.mimeType || "");
+        return /wav/i.test(mt) || raw.slice(0, 4).toString() === "RIFF" ? raw : wavFromPcm(raw, +((mt.match(/rate=(\d+)/) || [])[1] || 24000));
+      } catch (e) {last = m + ": " + e.message;}
+    }
   }
-  console.warn("tts", last); send(res, 502, JSON.stringify({error: {message: "تعذّر توليد الصوت: " + last}}), J);
+  throw Object.assign(new Error(last || "no model"), {status: 503});
 }
+/* يرجع الصوت من الذاكرة ← التخزين الدائم ← التوليد (ولا يولّد النص نفسه مرتين بالتوازي) */
+async function getAudio(text, lang) {
+  const key = ttsKey(text, lang);
+  if (ttsCache.has(key)) return {wav: ttsCache.get(key), src: "memory"};
+  if (ttsPending.has(key)) return ttsPending.get(key);
+  const job = (async () => {
+    const st = await fromStorage(key); if (st) {remember2(key, st); return {wav: st, src: "storage"};}
+    const wav = await generate(text, lang); remember2(key, wav); toStorage(key, wav); return {wav, src: "generated"};
+  })().finally(() => ttsPending.delete(key));
+  ttsPending.set(key, job); return job;
+}
+async function tts(req, res, u) {
+  const J = {"Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store"};
+  if (!GEMINI) return send(res, 503, JSON.stringify({error: {message: "GEMINI_API_KEY غير مضبوط"}}), J);
+  let text = u.searchParams.get("t"), lang = u.searchParams.get("l");
+  if (req.method === "POST") {try {const b = JSON.parse((await readBody(req, 20000)).toString() || "{}"); text = b.text; lang = b.lang;} catch (e) {return send(res, 400, JSON.stringify({error: {message: "bad json"}}), J);}}
+  text = String(text || "").replace(/\s+/g, " ").trim().slice(0, 1200); lang = lang === "en" ? "en" : "ar";
+  if (!text) return send(res, 400, JSON.stringify({error: {message: "no text"}}), J);
+  const key = ttsKey(text, lang);
+  if (!ttsCache.has(key)) { /* الحدّ يطبَّق فقط على المقاطع الجديدة */
+    const ip = String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || "").split(",")[0].trim();
+    if (limited("tts:" + ip)) return send(res, 429, JSON.stringify({error: {message: "طلبات كثيرة"}}), J);
+  }
+  try {const a = await getAudio(text, lang); send(res, 200, a.wav, {"Content-Type": "audio/wav", "Content-Length": a.wav.length, "Cache-Control": "public, max-age=31536000, immutable", "X-TTS-Source": a.src});}
+  catch (e) {console.warn("tts", e.message); send(res, 503, JSON.stringify({error: {message: "تعذّر توليد الصوت: " + e.message}}), J);}
+}
+/* تجهيز سرد القصة مسبقاً (مرة واحدة فقط بفضل التخزين الدائم) */
+async function warmNarration() {
+  let n; try {n = JSON.parse(fs.readFileSync(path.join(ROOT, "narration.json"), "utf8"));} catch (e) {return;}
+  for (const lang of ["ar", "en"]) for (const line of n[lang] || []) {
+    try {const a = await getAudio(line, lang); if (a.src === "generated") await new Promise(r => setTimeout(r, 7000));}
+    catch (e) {console.warn("warm narration stopped:", e.message); return;}
+  }
+  console.log("narration ready");
+}
+if (GEMINI && SB_SECRET) setTimeout(warmNarration, 4000); /* بدون تخزين دائم لا نستهلك الحصة عند كل تشغيل */
 
 /* ---------- الخادم ---------- */
 function send(res, code, body, headers) {res.writeHead(code, Object.assign({"X-Content-Type-Options": "nosniff"}, headers)); res.end(body);}
@@ -158,7 +215,7 @@ http.createServer(async (req, res) => {
   const u = new URL(req.url, "http://x");
   if (u.pathname === "/healthz") return send(res, 200, "ok", {"Content-Type": "text/plain"});
   const gm = u.pathname.match(GEM_PATH); if (gm) return gemini(req, res, gm, u);
-  if (u.pathname === "/api/tts" && req.method === "POST") return tts(req, res);
+  if (u.pathname === "/api/tts" && (req.method === "POST" || req.method === "GET")) return tts(req, res, u);
   const m = u.pathname.match(/^\/api\/yt\/(search|videos)$/);
   if (m) {
     try {const j = await yt(m[1], u.searchParams); send(res, 200, JSON.stringify(j), {"Content-Type": "application/json; charset=utf-8", "Cache-Control": "public, max-age=600", "Access-Control-Allow-Origin": "*"});}
@@ -177,4 +234,4 @@ http.createServer(async (req, res) => {
   if (gz) h["Content-Encoding"] = "gzip";
   const body = gz ? f.gz : f.raw; h["Content-Length"] = body.length;
   send(res, 200, req.method === "HEAD" ? "" : body, h);
-}).listen(PORT, () => console.log("Alpha LogicX on :" + PORT + (KEY ? " · YouTube key ✓" : " · no YouTube key (direct search)") + (GEMINI ? " · Gemini key ✓" : " · NO GEMINI_API_KEY → AI assistant off")));
+}).listen(PORT, () => console.log("Alpha LogicX on :" + PORT + (KEY ? " · YouTube key ✓" : " · no YouTube key (direct search)") + (GEMINI ? " · Gemini key ✓" : " · NO GEMINI_API_KEY → AI assistant off") + (SB_SECRET ? " · voice storage ✓" : " · no SUPABASE_SECRET_KEY (voice cached in memory only)")));
