@@ -1,9 +1,0 @@
-{
-  "name": "alpha-logicx",
-  "version": "1.0.0",
-  "private": true,
-  "description": "Alpha LogicX — منصة تعليمية لطلاب BTEC IT",
-  "main": "server.js",
-  "scripts": { "start": "node server.js" },
-  "engines": { "node": ">=18" }
-}
