@@ -9,11 +9,12 @@
 1. ارفع هذا المجلد كما هو إلى مستودع GitHub جديد.
 2. في Render: **New → Blueprint** واختر المستودع. سيقرأ `render.yaml` وينشئ الخدمة لوحده.
    (أو **New → Web Service**: Build Command = `echo no build`، Start Command = `node server.js`)
-3. (اختياري لكن مُستحسن) في **Environment** أضف `YOUTUBE_API_KEY` = مفتاح YouTube Data API v3 من Google Cloud Console.
+3. **مهم للمساعد الذكي:** في **Environment** أضف `GEMINI_API_KEY` = مفتاح من https://aistudio.google.com/apikey — بدونه المساعد لا يعمل.
+4. (اختياري لكن مُستحسن) في **Environment** أضف `YOUTUBE_API_KEY` = مفتاح YouTube Data API v3 من Google Cloud Console.
    - مع المفتاح: البحث رسمي وسريع (حوالي 100 بحث يومياً مجاناً، والنتائج تُخزَّن ساعة).
    - بدونه: الخادم يقرأ نتائج يوتيوب مباشرة. يعمل غالباً، لكن يوتيوب قد يحظره أحياناً.
    - إذا نفدت حصة المفتاح، يتحوّل الخادم تلقائياً للقراءة المباشرة.
-4. افتح رابط الموقع `https://….onrender.com` — البحث يستخدم `/api/yt` تلقائياً، بدون أي تعديل في الكود.
+5. افتح رابط الموقع `https://….onrender.com` — البحث يستخدم `/api/yt` تلقائياً، بدون أي تعديل في الكود.
 
 ## ملاحظات
 - لا تفتح `index.html` كملف من الجهاز: يوتيوب يرفض تشغيل الفيديوهات المضمّنة في صفحة بلا رابط https، والبحث يحتاج الخادم.

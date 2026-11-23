@@ -9,6 +9,7 @@ const http = require("http"), fs = require("fs"), path = require("path"), zlib =
 
 const PORT = process.env.PORT || 10000;
 const KEY = (process.env.YOUTUBE_API_KEY || "").trim();
+const GEMINI = (process.env.GEMINI_API_KEY || "").trim();
 /* يبحث عن index.html في أكثر من مكان حتى لو تغيّر ترتيب المجلدات في المستودع */
 const ROOT = [path.join(__dirname, "public"), __dirname, path.join(__dirname, "deploy", "public"), path.join(process.cwd(), "public")]
   .find(d => fs.existsSync(path.join(d, "index.html"))) || path.join(__dirname, "public");
@@ -90,11 +91,38 @@ async function yt(route, qs) {
   throw Object.assign(new Error("not found"), {status: 404});
 }
 
+/* ---------- Gemini: الموقع يرسل كل طلبات generativelanguage.googleapis.com إلى /api/gemini/v1beta/...
+   والمفتاح يُضاف هنا من GEMINI_API_KEY فلا يصل للمتصفح أبداً ---------- */
+const GEM_PATH = /^\/api\/gemini\/(v1beta|v1)\/(models(?:\/[\w.-]+:(?:generateContent|countTokens))?)$/;
+const hits = new Map(); /* حدّ بسيط: 40 طلب/دقيقة لكل IP */
+function limited(ip) {const now = Date.now(), h = (hits.get(ip) || []).filter(t => now - t < 60e3); h.push(now); hits.set(ip, h); if (hits.size > 5000) hits.clear(); return h.length > 40;}
+function readBody(req, max) {
+  return new Promise((ok, bad) => {let n = 0; const parts = []; req.on("data", c => {n += c.length; if (n > max) {bad(Object.assign(new Error("body too large"), {status: 413})); req.destroy();} else parts.push(c);}); req.on("end", () => ok(Buffer.concat(parts))); req.on("error", bad);});
+}
+async function gemini(req, res, m, u) {
+  const J = {"Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store"};
+  if (!GEMINI) return send(res, 503, JSON.stringify({error: {message: "GEMINI_API_KEY غير مضبوط على السيرفر (Render → Environment)", status: "NO_KEY"}}), J);
+  const ip = String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || "").split(",")[0].trim();
+  if (limited(ip)) return send(res, 429, JSON.stringify({error: {message: "طلبات كثيرة، انتظر دقيقة", status: "RESOURCE_EXHAUSTED"}}), J);
+  const isPost = req.method === "POST";
+  if (isPost !== /:/.test(m[2])) return send(res, 405, JSON.stringify({error: {message: "method not allowed"}}), J);
+  try {
+    const body = isPost ? await readBody(req, 2 * 1048576) : undefined;
+    const q = new URLSearchParams(); if (u.searchParams.get("pageSize")) q.set("pageSize", u.searchParams.get("pageSize")); if (u.searchParams.get("pageToken")) q.set("pageToken", u.searchParams.get("pageToken"));
+    const r = await fetch("https://generativelanguage.googleapis.com/" + m[1] + "/" + m[2] + (q.toString() ? "?" + q : ""), {method: req.method, body, headers: {"Content-Type": "application/json", "x-goog-api-key": GEMINI}, signal: AbortSignal.timeout(60000)});
+    const out = Buffer.from(await r.arrayBuffer());
+    if (!r.ok) console.warn("gemini", r.status, m[2], out.toString().slice(0, 200));
+    send(res, r.status, out, J);
+  } catch (e) {console.warn("gemini", e.message); send(res, e.status || 502, JSON.stringify({error: {message: "تعذّر الوصول إلى Gemini: " + e.message}}), J);}
+}
+
 /* ---------- الخادم ---------- */
 function send(res, code, body, headers) {res.writeHead(code, Object.assign({"X-Content-Type-Options": "nosniff"}, headers)); res.end(body);}
 http.createServer(async (req, res) => {
   const u = new URL(req.url, "http://x");
   if (u.pathname === "/healthz") return send(res, 200, "ok", {"Content-Type": "text/plain"});
+  const gm = u.pathname.match(GEM_PATH); if (gm) return gemini(req, res, gm, u);
+  if (u.pathname.startsWith("/api/")) return send(res, 404, JSON.stringify({error: {message: "unknown api"}}), {"Content-Type": "application/json"});
   const m = u.pathname.match(/^\/api\/yt\/(search|videos)$/);
   if (m) {
     try {const j = await yt(m[1], u.searchParams); send(res, 200, JSON.stringify(j), {"Content-Type": "application/json; charset=utf-8", "Cache-Control": "public, max-age=600", "Access-Control-Allow-Origin": "*"});}
@@ -112,4 +140,4 @@ http.createServer(async (req, res) => {
   if (gz) h["Content-Encoding"] = "gzip";
   const body = gz ? f.gz : f.raw; h["Content-Length"] = body.length;
   send(res, 200, req.method === "HEAD" ? "" : body, h);
-}).listen(PORT, () => console.log("Alpha LogicX on :" + PORT + (KEY ? " (YouTube API key set)" : " (no YouTube key: direct search)")));
+}).listen(PORT, () => console.log("Alpha LogicX on :" + PORT + (KEY ? " · YouTube key ✓" : " · no YouTube key (direct search)") + (GEMINI ? " · Gemini key ✓" : " · NO GEMINI_API_KEY → AI assistant off")));
