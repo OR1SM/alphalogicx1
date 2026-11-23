@@ -9,7 +9,9 @@ const http = require("http"), fs = require("fs"), path = require("path"), zlib =
 
 const PORT = process.env.PORT || 10000;
 const KEY = (process.env.YOUTUBE_API_KEY || "").trim();
-const ROOT = path.join(__dirname, "public");
+/* يبحث عن index.html في أكثر من مكان حتى لو تغيّر ترتيب المجلدات في المستودع */
+const ROOT = [path.join(__dirname, "public"), __dirname, path.join(__dirname, "deploy", "public"), path.join(process.cwd(), "public")]
+  .find(d => fs.existsSync(path.join(d, "index.html"))) || path.join(__dirname, "public");
 const API = "https://www.googleapis.com/youtube/v3";
 
 /* ---------- الملفات الثابتة: تُقرأ وتُضغط مرة واحدة عند التشغيل ---------- */
@@ -23,7 +25,10 @@ function load(rel) {
   const f = {raw, type, etag: '"' + crypto.createHash("sha1").update(raw).digest("hex").slice(0, 16) + '"', gz: /text|json|svg|javascript/.test(type) ? zlib.gzipSync(raw, {level: 9}) : null};
   files.set(rel, f); return f;
 }
-console.time("index ready"); load("index.html"); console.timeEnd("index ready");
+console.time("index ready");
+if (load("index.html")) console.log("serving", path.join(ROOT, "index.html"), (files.get("index.html").raw.length / 1048576).toFixed(1) + " MB");
+else console.error("!! index.html NOT FOUND. Looked in: public/, ./, deploy/public/ — make sure the 76 MB index.html is in the GitHub repo.");
+console.timeEnd("index ready");
 
 /* ---------- يوتيوب ---------- */
 const cache = new Map(); /* استعلام → نتيجة (ساعة) */
@@ -98,7 +103,9 @@ http.createServer(async (req, res) => {
   }
   if (req.method !== "GET" && req.method !== "HEAD") return send(res, 405, "");
   let rel = decodeURIComponent(u.pathname).replace(/^\/+/, "") || "index.html";
+  if (rel === "server.js" || rel === "package.json" || rel.startsWith(".")) rel = "index.html"; /* لا نكشف ملفات الخادم */
   const f = load(rel) || load("index.html"); /* أي مسار آخر يعيد الموقع نفسه */
+  if (!f) return send(res, 503, "<h1 dir=rtl>Alpha LogicX: ملف index.html غير موجود في المستودع</h1>", {"Content-Type": "text/html; charset=utf-8"});
   if (req.headers["if-none-match"] === f.etag) return send(res, 304, "", {ETag: f.etag});
   const gz = f.gz && /\bgzip\b/.test(req.headers["accept-encoding"] || "");
   const h = {"Content-Type": f.type, ETag: f.etag, "Cache-Control": rel === "index.html" ? "no-cache" : "public, max-age=86400", Vary: "Accept-Encoding"};
