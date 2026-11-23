@@ -95,7 +95,7 @@ async function yt(route, qs) {
    والمفتاح يُضاف هنا من GEMINI_API_KEY فلا يصل للمتصفح أبداً ---------- */
 const GEM_PATH = /^\/api\/gemini\/(v1beta|v1)\/(models(?:\/[\w.-]+:(?:generateContent|countTokens))?)$/;
 const hits = new Map(); /* حدّ بسيط: 40 طلب/دقيقة لكل IP */
-function limited(ip) {const now = Date.now(), h = (hits.get(ip) || []).filter(t => now - t < 60e3); h.push(now); hits.set(ip, h); if (hits.size > 5000) hits.clear(); return h.length > 40;}
+function limited(ip) {const now = Date.now(), h = (hits.get(ip) || []).filter(t => now - t < 60e3); h.push(now); hits.set(ip, h); if (hits.size > 5000) hits.clear(); return h.length > (ip.startsWith("tts:") ? 60 : 40);}
 function readBody(req, max) {
   return new Promise((ok, bad) => {let n = 0; const parts = []; req.on("data", c => {n += c.length; if (n > max) {bad(Object.assign(new Error("body too large"), {status: 413})); req.destroy();} else parts.push(c);}); req.on("end", () => ok(Buffer.concat(parts))); req.on("error", bad);});
 }
@@ -116,12 +116,49 @@ async function gemini(req, res, m, u) {
   } catch (e) {console.warn("gemini", e.message); send(res, e.status || 502, JSON.stringify({error: {message: "تعذّر الوصول إلى Gemini: " + e.message}}), J);}
 }
 
+/* ---------- قراءة النص بصوت Google (Gemini TTS) ----------
+   POST /api/tts {text, lang} → audio/wav. يُخزَّن الصوت مؤقتاً فلا يُطلب النص نفسه مرتين. */
+const TTS_MODELS = ["gemini-3.8-flash-tts", "gemini-3.8-flash-lite-tts", "gemini-3.1-flash-tts-preview", "gemini-2.5-flash-preview-tts"];
+const ttsCache = new Map();
+function wavFromPcm(pcm, rate) {
+  const h = Buffer.alloc(44); h.write("RIFF", 0); h.writeUInt32LE(36 + pcm.length, 4); h.write("WAVE", 8); h.write("fmt ", 12); h.writeUInt32LE(16, 16); h.writeUInt16LE(1, 20); h.writeUInt16LE(1, 22);
+  h.writeUInt32LE(rate, 24); h.writeUInt32LE(rate * 2, 28); h.writeUInt16LE(2, 32); h.writeUInt16LE(16, 34); h.write("data", 36); h.writeUInt32LE(pcm.length, 40); return Buffer.concat([h, pcm]);
+}
+async function tts(req, res) {
+  const J = {"Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store"};
+  if (!GEMINI) return send(res, 503, JSON.stringify({error: {message: "GEMINI_API_KEY غير مضبوط"}}), J);
+  const ip = String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || "").split(",")[0].trim();
+  if (limited("tts:" + ip)) return send(res, 429, JSON.stringify({error: {message: "طلبات كثيرة"}}), J);
+  let body; try {body = JSON.parse((await readBody(req, 20000)).toString() || "{}");} catch (e) {return send(res, 400, JSON.stringify({error: {message: "bad json"}}), J);}
+  const text = String(body.text || "").replace(/\s+/g, " ").trim().slice(0, 900), voice = /^[A-Za-z]{2,20}$/.test(body.voice || "") ? body.voice : "Kore";
+  if (!text) return send(res, 400, JSON.stringify({error: {message: "no text"}}), J);
+  const key = voice + "|" + text, hit = ttsCache.get(key);
+  const A = {"Content-Type": "audio/wav", "Cache-Control": "public, max-age=86400"};
+  if (hit) {ttsCache.delete(key); ttsCache.set(key, hit); return send(res, 200, hit, A);}
+  let last = "";
+  for (const m of TTS_MODELS) {
+    try {
+      const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models/" + m + ":generateContent", {method: "POST", headers: {"Content-Type": "application/json", "x-goog-api-key": GEMINI}, signal: AbortSignal.timeout(30000),
+        body: JSON.stringify({contents: [{parts: [{text}]}], generationConfig: {responseModalities: ["AUDIO"], speechConfig: {voiceConfig: {prebuiltVoiceConfig: {voiceName: voice}}}}})});
+      const j = await r.json().catch(() => ({}));
+      const p = j.candidates && j.candidates[0] && j.candidates[0].content && (j.candidates[0].content.parts || []).find(x => x.inlineData);
+      if (!r.ok || !p) {last = m + ": " + ((j.error && j.error.message) || r.status); continue;}
+      const raw = Buffer.from(p.inlineData.data, "base64"), mt = String(p.inlineData.mimeType || "");
+      const wav = /wav/i.test(mt) || raw.slice(0, 4).toString() === "RIFF" ? raw : wavFromPcm(raw, +((mt.match(/rate=(\d+)/) || [])[1] || 24000));
+      ttsCache.set(key, wav); if (ttsCache.size > 120) ttsCache.delete(ttsCache.keys().next().value);
+      return send(res, 200, wav, A);
+    } catch (e) {last = m + ": " + e.message;}
+  }
+  console.warn("tts", last); send(res, 502, JSON.stringify({error: {message: "تعذّر توليد الصوت: " + last}}), J);
+}
+
 /* ---------- الخادم ---------- */
 function send(res, code, body, headers) {res.writeHead(code, Object.assign({"X-Content-Type-Options": "nosniff"}, headers)); res.end(body);}
 http.createServer(async (req, res) => {
   const u = new URL(req.url, "http://x");
   if (u.pathname === "/healthz") return send(res, 200, "ok", {"Content-Type": "text/plain"});
   const gm = u.pathname.match(GEM_PATH); if (gm) return gemini(req, res, gm, u);
+  if (u.pathname === "/api/tts" && req.method === "POST") return tts(req, res);
   const m = u.pathname.match(/^\/api\/yt\/(search|videos)$/);
   if (m) {
     try {const j = await yt(m[1], u.searchParams); send(res, 200, JSON.stringify(j), {"Content-Type": "application/json; charset=utf-8", "Cache-Control": "public, max-age=600", "Access-Control-Allow-Origin": "*"});}
