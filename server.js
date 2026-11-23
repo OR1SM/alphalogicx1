@@ -122,13 +122,13 @@ http.createServer(async (req, res) => {
   const u = new URL(req.url, "http://x");
   if (u.pathname === "/healthz") return send(res, 200, "ok", {"Content-Type": "text/plain"});
   const gm = u.pathname.match(GEM_PATH); if (gm) return gemini(req, res, gm, u);
-  if (u.pathname.startsWith("/api/")) return send(res, 404, JSON.stringify({error: {message: "unknown api"}}), {"Content-Type": "application/json"});
   const m = u.pathname.match(/^\/api\/yt\/(search|videos)$/);
   if (m) {
     try {const j = await yt(m[1], u.searchParams); send(res, 200, JSON.stringify(j), {"Content-Type": "application/json; charset=utf-8", "Cache-Control": "public, max-age=600", "Access-Control-Allow-Origin": "*"});}
     catch (e) {console.warn("yt", m[1], e.message); send(res, e.status && e.status < 500 ? e.status : 502, JSON.stringify({error: {message: e.message}}), {"Content-Type": "application/json", "Access-Control-Allow-Origin": "*"});}
     return;
   }
+  if (u.pathname.startsWith("/api/")) return send(res, 404, JSON.stringify({error: {message: "unknown api"}}), {"Content-Type": "application/json"});
   if (req.method !== "GET" && req.method !== "HEAD") return send(res, 405, "");
   let rel = decodeURIComponent(u.pathname).replace(/^\/+/, "") || "index.html";
   if (rel === "server.js" || rel === "package.json" || rel.startsWith(".")) rel = "index.html"; /* لا نكشف ملفات الخادم */
